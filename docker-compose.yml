@@ -11,6 +11,7 @@ services:
       AAS_DEVICE: cpu
       AAS_LOG_LEVEL: INFO
       AAS_TORCH_COMPILE: "false"
+      AAS_LANGUAGE_DETECTION_ENABLED: "true"
       HF_HOME: /home/app/.cache/huggingface
       TORCHINDUCTOR_CACHE_DIR: /home/app/.cache/torchinductor
     volumes:

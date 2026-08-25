@@ -22,6 +22,9 @@ async def test_analyze_returns_full_valid_response(client: AsyncClient) -> None:
     assert parsed.contact_id == contact_id
     assert parsed.gender.prediction.value == "male"
     assert parsed.age_bracket.prediction.value == "31-45"
+    assert parsed.language.code == "en"
+    assert parsed.language.name == "English"
+    assert parsed.language.confidence == 0.92
     assert 0.0 <= parsed.gender.confidence <= 1.0
     assert 0.0 <= parsed.age_bracket.confidence <= 1.0
     assert parsed.processing_ms >= 0
@@ -40,6 +43,11 @@ async def test_insufficient_silence_returns_200(client: AsyncClient) -> None:
     assert body["audio_quality"] == "insufficient"
     assert body["gender"] == {"prediction": "unknown", "confidence": 0.0}
     assert body["age_bracket"] == {"prediction": "unknown", "confidence": 0.0}
+    assert body["language"] == {
+        "code": "unknown",
+        "name": "unknown",
+        "confidence": 0.0,
+    }
 
 
 @pytest.mark.asyncio
@@ -53,4 +61,4 @@ async def test_metrics_exposes_required_series(client: AsyncClient) -> None:
     assert response.status_code == 200
     assert "audio_analysis_requests_total" in response.text
     assert "audio_analysis_component_ready" in response.text
-
+    assert "audio_analysis_language_outcomes_total" in response.text

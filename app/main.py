@@ -37,10 +37,11 @@ def create_app(
 
     application = FastAPI(
         title=selected_settings.app_name,
-        version="1.0.0",
+        version="1.1.0",
         description=(
-            "Conservative age-bracket and gender-presentation estimates from short "
-            "contact-side call audio. Caller audio is not intentionally persisted."
+            "Conservative age-bracket, gender-presentation, and best-effort spoken-"
+            "language estimates from short contact-side call audio. Caller audio is "
+            "not intentionally persisted."
         ),
         lifespan=lifespan,
     )
@@ -76,4 +77,3 @@ def create_app(
 
 
 app = create_app()
-

@@ -9,6 +9,7 @@ from app.audio.quality import warmup_quality_analysis
 from app.audio.vad import SileroVoiceActivityDetector, VoiceActivityDetector
 from app.core.config import Settings
 from app.core.metrics import Metrics
+from app.inference.language import LanguageInference, LanguageModelService
 from app.inference.model import AttributeInference, AttributeModelService
 
 logger = logging.getLogger(__name__)
@@ -22,6 +23,8 @@ class RuntimeState:
     vad: VoiceActivityDetector | None = None
     model: AttributeInference | None = None
     model_service: AttributeModelService | None = None
+    language: LanguageInference | None = None
+    language_model_service: LanguageModelService | None = None
 
     @property
     def vad_loaded(self) -> bool:
@@ -30,6 +33,10 @@ class RuntimeState:
     @property
     def model_loaded(self) -> bool:
         return self.model is not None
+
+    @property
+    def language_model_loaded(self) -> bool:
+        return self.language is not None
 
     @property
     def ready(self) -> bool:
@@ -41,10 +48,15 @@ class RuntimeState:
         )
         self.metrics.readiness.labels(component="vad").set(int(self.vad_loaded))
         self.metrics.readiness.labels(component="model").set(int(self.model_loaded))
+        self.metrics.readiness.labels(component="language_model").set(
+            int(self.language_model_loaded)
+        )
 
     def close(self) -> None:
         if self.model_service is not None:
             self.model_service.close()
+        if self.language_model_service is not None:
+            self.language_model_service.close()
 
 
 async def initialize_runtime(settings: Settings, metrics: Metrics) -> RuntimeState:
@@ -79,6 +91,21 @@ async def initialize_runtime(settings: Settings, metrics: Metrics) -> RuntimeSta
             extra={"event_fields": {"error_type": type(exc).__name__}},
         )
 
+    if settings.language_detection_enabled:
+        language_model: LanguageModelService | None = None
+        try:
+            language_model = await asyncio.to_thread(LanguageModelService.load, settings)
+            await asyncio.to_thread(language_model.warmup)
+            runtime.language = language_model
+            runtime.language_model_service = language_model
+        except Exception as exc:
+            if language_model is not None:
+                language_model.close()
+            logger.exception(
+                "language_model_initialization_failed",
+                extra={"event_fields": {"error_type": type(exc).__name__}},
+            )
+
     runtime.update_metrics()
     logger.info(
         "runtime_initialized",
@@ -87,6 +114,7 @@ async def initialize_runtime(settings: Settings, metrics: Metrics) -> RuntimeSta
                 "ffmpeg_available": runtime.ffmpeg_available,
                 "vad_loaded": runtime.vad_loaded,
                 "model_loaded": runtime.model_loaded,
+                "language_model_loaded": runtime.language_model_loaded,
                 "ready": runtime.ready,
                 "device": settings.device,
                 "torch_compile": settings.torch_compile,

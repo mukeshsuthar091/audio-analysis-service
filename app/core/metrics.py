@@ -34,6 +34,17 @@ class Metrics:
             "Age/gender model inference latency.",
             registry=self.registry,
         )
+        self.language_inference_latency = Histogram(
+            "audio_analysis_language_inference_duration_seconds",
+            "Best-effort spoken-language inference latency.",
+            registry=self.registry,
+        )
+        self.language_outcomes = Counter(
+            "audio_analysis_language_outcomes_total",
+            "Language enrichment results by bounded operational outcome.",
+            ("outcome",),
+            registry=self.registry,
+        )
         self.quality_counts = Counter(
             "audio_analysis_quality_total",
             "Completed analyses by quality class.",
@@ -52,6 +63,5 @@ class Metrics:
             ("component",),
             registry=self.registry,
         )
-        for component in ("ffmpeg", "vad", "model"):
+        for component in ("ffmpeg", "vad", "model", "language_model"):
             self.readiness.labels(component=component).set(0)
-

@@ -5,12 +5,13 @@ A production-style Python 3.11/FastAPI service that analyzes a short inbound log
 - gender presentation: `male`, `female`, or `unknown`
 - age bracket: `18-30`, `31-45`, `46-60`, `60+`, or `unknown`
 - heuristic confidence for each attribute
+- best-effort spoken language code, name, and confidence
 - audio quality: `good`, `degraded`, or `insufficient`
 - end-to-end processing time
 
 The service is uncertainty-aware. Silence, short speech, clipping, low volume, noise, mixed voices, or weak model evidence result in `unknown` instead of an unreliable categorical answer. Caller audio is processed locally in memory and is never sent to an external inference API.
 
-> **License notice:** the required `audeering/wav2vec2-large-robust-6-ft-age-gender` checkpoint is licensed under CC BY-NC-SA 4.0. Commercial use requires a separate legal and licensing review.
+> **License notice:** the required `audeering/wav2vec2-large-robust-6-ft-age-gender` checkpoint is licensed under CC BY-NC-SA 4.0. Commercial use requires a separate legal and licensing review. The SpeechBrain VoxLingua107 checkpoint is Apache-2.0 licensed.
 
 ## Features
 
@@ -21,6 +22,7 @@ The service is uncertainty-aware. Silence, short speech, clipping, low volume, n
 - Silero VAD with speech duration, ratio, segment merging, and inference-input extraction
 - Signal-quality checks for RMS, peak, clipping, silence, and approximate SNR
 - audEERING six-layer Wav2Vec2 age/gender inference
+- SpeechBrain VoxLingua107 ECAPA spoken-language identification
 - Conservative confidence thresholds, gender-class margin, and age-boundary rejection
 - FastAPI lifespan initialization, warm-up, readiness state, and graceful startup failure
 - Bounded inference concurrency without blocking the event loop
@@ -30,7 +32,7 @@ The service is uncertainty-aware. Silence, short speech, clipping, low volume, n
 
 ## Scope and non-goals
 
-Version 1 implements buffered REST analysis only. It does not implement streaming, WebSockets, progressive predictions, transcription, language or accent detection, speaker identity, evaluation datasets, or speaker diarization. It estimates vocal presentation rather than identity, legal sex, actual gender identity, or exact age. Results should be treated as low-stakes routing hints and must not be the sole basis for consequential decisions.
+Version 1 implements buffered REST analysis only. It does not implement streaming, WebSockets, progressive predictions, transcription, accent detection, speaker identity, evaluation datasets, or speaker diarization. It estimates vocal presentation rather than identity, legal sex, actual gender identity, or exact age. Language identification is best effort and does not create a transcript. Results should be treated as low-stakes routing hints and must not be the sole basis for consequential decisions.
 
 ## Architecture
 
@@ -50,6 +52,8 @@ flowchart LR
     Gate -- Yes --> Worker[Bounded inference worker]
     Worker --> Model[6-layer Wav2Vec2]
     Model --> Policy[Age and gender policy]
+    Worker --> LID[VoxLingua107 language ID]
+    LID --> Policy
     Policy --> Response[Typed JSON]
     Unknown --> Response
     API -. logs and timings .-> Observe[Prometheus + JSON logs]
@@ -68,13 +72,16 @@ FastAPI lifespan loads and warms FFmpeg availability, Silero VAD, and the audEER
 7. Calculate RMS, peak, clipping ratio, silence ratio, and an approximate speech/non-speech RMS SNR.
 8. Return `insufficient` and skip inference when speech or signal quality is unusable.
 9. Otherwise run Wav2Vec2 under `model.eval()` and `torch.inference_mode()`.
-10. Apply confidence, quality, margin, and age-boundary policies; emit operational telemetry and clear mutable request buffers.
+10. When at least 1.5 seconds of speech is available, run optional language identification on the same speech waveform without decoding or resampling again.
+11. Apply confidence, quality, margin, and age-boundary policies; emit operational telemetry and clear mutable request buffers.
 
 The SNR calculation is an explainable approximation, not a laboratory measurement. Noise overlapping speech may not be fully represented by the non-speech reference frames.
 
 ## Design decisions and model rationale
 
 The audEERING `wav2vec2-large-robust-6-ft-age-gender` checkpoint was selected because it directly provides normalized age and `female`/`male`/`child` outputs while using six fine-tuned transformer layers rather than the larger 24-layer alternative. This makes it a reasonable CPU-oriented assignment baseline. The local model class mirrors the published head, loads safetensors without remote executable code, and interprets the checkpoint tensor order as `female`, `male`, `child`. Normalized age is converted to approximate years internally but only a bracket is exposed.
+
+For language, `speechbrain/lang-id-voxlingua107-ecapa` was chosen because its roughly 86 MB ECAPA classifier accepts the existing mono 16 kHz waveform, covers 107 language labels, and is far smaller than one-billion-parameter MMS-LID. The repository revision is pinned, loaded from the local Hugging Face snapshot, and never receives caller audio over the network. Its labels provide a short code and readable name. The model is optional: loading or inference failure produces `unknown` language while preserving core age/gender analysis.
 
 Silero VAD prevents silence and long non-speech regions from reaching the attribute model. FFmpeg handles compressed and telephony containers, while a strict RIFF parser bypasses subprocess startup for mono 16 kHz PCM16/float32 WAV. NumPy and librosa provide transparent signal measurements. Confidence is deliberately conservative: poor quality reduces confidence, close gender classes and age-boundary estimates become `unknown`, and insufficient audio skips inference entirely. These scores are assignment-level heuristics, not calibrated probabilities.
 
@@ -93,7 +100,7 @@ The service cannot reliably separate mixed inbound speakers. When mixed voices w
 - Python 3.11
 - FFmpeg available on `PATH`
 - Docker with Compose for the container workflow
-- Internet access on first startup to download the public audEERING checkpoint
+- Internet access on first startup to download the public audEERING and SpeechBrain checkpoints
 - At least 4 GB RAM; 8 GB is recommended for model startup and container builds
 
 ## Local setup
@@ -125,7 +132,7 @@ cp .env.example .env
 uvicorn app.main:app --host 0.0.0.0 --port 8000
 ```
 
-Startup loads Silero from the installed package and downloads/caches the public audEERING checkpoint when it is not already present. Startup is complete when `/ready` returns HTTP 200. If initialization fails, `/health` remains available, `/ready` returns 503, and `/analyze` returns 503.
+Startup loads Silero from the installed package and downloads/caches the public audEERING and SpeechBrain checkpoints when they are not already present. Core startup is complete when `/ready` returns HTTP 200. If FFmpeg, VAD, or age/gender initialization fails, `/health` remains available while `/ready` and `/analyze` return 503. Language loading is optional and is reported separately.
 
 ## Docker setup
 
@@ -172,18 +179,21 @@ Returns HTTP 200 only when FFmpeg, VAD, model loading, and warm-up have succeede
 {
   "status": "ready",
   "model_loaded": true,
+  "language_model_loaded": true,
   "vad_loaded": true,
   "ffmpeg_available": true
 }
 ```
 
-A non-ready response uses HTTP 503, reports `status: "not_ready"`, and includes the same component booleans.
+Core readiness depends on FFmpeg, VAD, and the age/gender model. A core non-ready response uses HTTP 503 and `status: "not_ready"`. `language_model_loaded` may be false while the service remains ready because language is optional enrichment.
 
 ### `GET /metrics`
 
 Returns Prometheus text exposition for requests, latency, quality, unknown predictions, and component readiness.
 
 ### `POST /analyze`
+
+The required `language` object was added in API version 1.1. This is an intentional breaking response-schema change for strict clients; update generated clients and response validators before upgrading from version 1.0.
 
 Required multipart fields:
 
@@ -210,6 +220,7 @@ Successful response:
   "contact_id": "80b59383-0a73-4fd7-9364-d01f09ee7c64",
   "gender": {"prediction": "male", "confidence": 0.87},
   "age_bracket": {"prediction": "31-45", "confidence": 0.63},
+  "language": {"code": "en", "name": "English", "confidence": 0.82},
   "processing_ms": 184,
   "audio_quality": "good"
 }
@@ -222,6 +233,7 @@ Insufficient speech is a valid HTTP 200 result:
   "contact_id": "80b59383-0a73-4fd7-9364-d01f09ee7c64",
   "gender": {"prediction": "unknown", "confidence": 0.0},
   "age_bracket": {"prediction": "unknown", "confidence": 0.0},
+  "language": {"code": "unknown", "name": "unknown", "confidence": 0.0},
   "processing_ms": 48,
   "audio_quality": "insufficient"
 }
@@ -271,6 +283,8 @@ quality_multiplier × (0.55 × duration_factor + 0.45 × boundary_factor)
 
 Public confidence values are clamped to `[0, 1]` and rounded to two decimals. They are explainable safeguards, not formally calibrated probabilities.
 
+Language confidence is the highest SpeechBrain posterior multiplied by the same quality multiplier. The result becomes `unknown` when speech is shorter than 1.5 seconds, adjusted confidence is below 0.65, the top-two probability margin is below 0.15, the label is invalid, or the optional model is unavailable. Legacy model codes `iw` and `jw` are normalized to `he` and `jv`.
+
 ## Configuration
 
 Settings use the `AAS_` prefix and may be placed in `.env`. Defaults are defined in `app/core/config.py`; `.env.example` provides a practical starting point.
@@ -301,6 +315,14 @@ Settings use the `AAS_` prefix and may be placed in `.env`. Defaults are defined
 | `AAS_TORCH_COMPILE` | `false` | Enable `torch.compile` during startup |
 | `AAS_TORCH_COMPILE_MODE` | `default` | `default`, `reduce-overhead`, or `max-autotune` |
 | `AAS_TORCH_COMPILE_DYNAMIC` | `true` | Compile for variable input lengths |
+| `AAS_LANGUAGE_DETECTION_ENABLED` | `true` | Load optional spoken-language enrichment |
+| `AAS_LANGUAGE_MODEL_ID` | SpeechBrain VoxLingua107 | Hugging Face language model identifier |
+| `AAS_LANGUAGE_MODEL_REVISION` | Pinned commit | Immutable model snapshot revision |
+| `AAS_LANGUAGE_MIN_SPEECH_SECONDS` | `1.5` | Minimum speech required for language inference |
+| `AAS_LANGUAGE_CONFIDENCE_THRESHOLD` | `0.65` | Adjusted language-confidence threshold |
+| `AAS_LANGUAGE_MIN_MARGIN` | `0.15` | Minimum top-two language probability gap |
+| `AAS_LANGUAGE_INFERENCE_TIMEOUT_SECONDS` | `3.0` | Optional language deadline |
+| `AAS_LANGUAGE_INFERENCE_MAX_CONCURRENCY` | `1` | Bounded language worker slots |
 | `AAS_GENDER_CONFIDENCE_THRESHOLD` | `0.65` | Adjusted gender threshold |
 | `AAS_GENDER_MIN_MARGIN` | `0.10` | Minimum top-two class margin |
 | `AAS_AGE_CONFIDENCE_THRESHOLD` | `0.55` | Age-bracket heuristic threshold |
@@ -319,7 +341,7 @@ ruff check .
 pytest -q
 ```
 
-The suite covers age and gender policies, quality rules, waveform validation, direct WAV decoding, real FFmpeg WAV/MP3 normalization, multipart limits, error envelopes, readiness, metrics, complete API responses, and valid insufficient-audio responses.
+The suite covers age, gender, and language policies; quality rules; waveform validation; direct WAV decoding; real FFmpeg WAV/MP3 normalization; multipart limits; error envelopes; optional-language failures; readiness; metrics; complete API responses; and valid insufficient-audio responses.
 
 Run the opt-in real-checkpoint load/warm-up test:
 
@@ -327,7 +349,7 @@ Run the opt-in real-checkpoint load/warm-up test:
 RUN_REAL_MODEL_TESTS=1 pytest -m model -q
 ```
 
-Latest verified default result: **50 passed, 1 opt-in test skipped**.
+Latest verified result: **74 passed, 2 opt-in tests skipped**. The opt-in real SpeechBrain checkpoint load and warm-up test also passed separately.
 
 ## Smoke test
 
@@ -357,12 +379,13 @@ Use `--no-dynamic` for a fixed-shape comparison. The benchmark validates output 
 
 ## Observability
 
-Every `/analyze` request receives an `X-Request-ID`. Structured logs include request/contact IDs, a sanitized format hint, audio and speech duration, stage timings, quality, and outcome. Audio, waveforms, raw probabilities, embeddings, and FFmpeg stderr content are not logged.
+Every `/analyze` request receives an `X-Request-ID`. Structured logs include request/contact IDs, a sanitized format hint, audio and speech duration, stage timings, quality, language operational outcome, and request outcome. Detected language, audio, waveforms, raw probabilities, embeddings, and FFmpeg stderr content are not logged.
 
 `GET /metrics` exposes:
 
 - request counts labeled by outcome and HTTP status
 - end-to-end, decode, VAD, and inference latency histograms
+- language inference latency and bounded operational-outcome counters
 - quality-class and unknown-prediction counters
 - FFmpeg, VAD, and model readiness gauges
 
@@ -370,7 +393,7 @@ Production alerts should monitor readiness, 5xx/timeouts, p95 latency, queue sat
 
 ## Privacy
 
-Caller audio is treated as PII. The bounded multipart parser stores accepted bytes in a request-owned `bytearray`; it does not use framework upload-file spooling. Normalized WAV is decoded in memory, and other formats use FFmpeg pipes. The application creates no database record, object-store upload, transcript, speaker embedding, or external inference request. Model weights may be cached, but caller audio may not.
+Caller audio is treated as PII. The bounded multipart parser stores accepted bytes in a request-owned `bytearray`; it does not use framework upload-file spooling. Normalized WAV is decoded in memory, and other formats use FFmpeg pipes. The application creates no database record, object-store upload, transcript, speaker/language embedding, or external inference request. Model weights may be cached, but caller audio may not.
 
 Mutable buffers are overwritten or cleared where practical on success, failure, cancellation, and inference-worker completion. References to immutable/runtime copies are released. Python and the operating system cannot guarantee immediate physical memory erasure, so the service makes no such claim. Production deployment should add TLS, authentication, private networking, upstream body limits, and restricted log access.
 
@@ -378,12 +401,16 @@ Mutable buffers are overwritten or cleared where practical on success, failure, 
 
 Measurements were taken on an Apple M4 MacBook Air with 16 GB RAM using Colima Linux/ARM64 configured with 4 vCPUs and 8 GB RAM. They are observations, not portable throughput guarantees.
 
-| Scenario | Result |
-| --- | ---: |
-| Five-second speech, 10 warm sequential requests | 692 ms end-to-end p50; 1,454 ms p95 |
-| Normalized PCM16 WAV, no detected speech | 1.11 ms decode; 44 ms end-to-end |
+The language benchmark used one warm-up, five measured runs, four PyTorch threads, and synthetic model input. The route remains sequential because running both CPU models together failed the acceptance policy: parallel execution had to improve p50 while keeping p95 within 10% of sequential p95.
 
-The speech workload did not consistently meet the assignment’s sub-500 ms target. Its median model inference was approximately 569 ms; VM scheduling produced higher outliers.
+| Speech length | Attribute p50 | Language p50 | Sequential p50 / p95 | Parallel p50 / p95 | Decision |
+| --- | ---: | ---: | ---: | ---: | --- |
+| 3 seconds | 221.56 ms | 74.02 ms | 286.62 / 354.43 ms | 291.47 / 351.22 ms | Sequential |
+| 5 seconds | 331.37 ms | 94.56 ms | 425.94 / 484.38 ms | 453.66 / 531.02 ms | Sequential |
+
+Full HTTP checks used locally generated, uncommitted macOS TTS WAV files. Five three-second English requests measured 541 ms p50 and approximately 879 ms p95; five five-second requests measured 855 ms p50 and approximately 1,001 ms p95. Manual smoke checks returned `en: English` and `hi: Hindi`, each with confidence 1.0 on clean synthetic speech. These checks demonstrate wiring, not accuracy, fairness, or probability calibration. A normalized three-second WAV with no detected speech completed in 72 ms and correctly returned `insufficient`.
+
+The speech workload did not consistently meet the assignment’s sub-500 ms target. VM scheduling and complete pipeline work add material latency beyond model-forward-only measurements.
 
 The model-forward-only compilation benchmark used two warm-ups and ten measured runs. Compiled outputs matched eager output within `rtol=1e-4`, `atol=1e-5`.
 
@@ -402,6 +429,8 @@ Inductor did not improve median latency on this environment, so eager execution 
 - **Presentation, not identity:** predictions describe model-perceived vocal presentation and approximate age bracket, not identity or biological fact.
 - **Restricted gender classes:** the adult checkpoint classes are binary and do not represent all gender identities or vocal presentations.
 - **Heuristic confidence:** returned confidence values are not calibrated probabilities and need representative validation before production use.
+- **Language identification:** VoxLingua107 is best effort and can confuse related languages, code-switching, foreign accents, short clips, children, speech disorders, and underrepresented languages or voices.
+- **No accent output:** accent labels are language- and dataset-specific, so this version does not claim a universal accent classifier.
 - **Domain shift and bias:** languages, accents, codecs, health, disability, demographic groups, and logistics noise may be represented unevenly in training data.
 - **Noise sensitivity:** compression, overlapping speech, clipping, engines, road noise, and warehouse machinery can increase `unknown` or incorrect results.
 - **No raw codec metadata:** headerless μ-law and similar raw streams are rejected because channel/sample-rate information is unavailable.
@@ -412,7 +441,7 @@ Inductor did not improve median latency on this environment, so eager execution 
 
 ## Future improvements and scaling
 
-Accuracy work should begin with a licensed, representative logistics-call dataset for calibration, subgroup analysis, threshold tuning, and model comparison. Codec/noise augmentation and multi-window stability could improve confidence decisions. Speaker-change detection and diarization may be considered later after their latency and privacy impact is evaluated.
+Accuracy work should begin with a licensed, representative logistics-call dataset for calibration, subgroup analysis, threshold tuning, language/code-switch evaluation, and model comparison. Codec/noise augmentation and multi-window stability could improve confidence decisions. Language-specific accent models, speaker-change detection, and diarization may be considered later only after their label definitions, accuracy, latency, fairness, and privacy impact are evaluated.
 
 For a 1,000-call design:
 

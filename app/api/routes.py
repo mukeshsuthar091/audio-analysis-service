@@ -18,6 +18,12 @@ from app.core.exceptions import AppError
 from app.core.runtime import RuntimeState
 from app.inference.age import process_age
 from app.inference.gender import process_gender
+from app.inference.language import (
+    FloatWaveform,
+    LanguageInferenceTimeout,
+    process_language,
+    unknown_language,
+)
 from app.schemas.response import (
     AgeBracket,
     AgeBracketResult,
@@ -26,6 +32,7 @@ from app.schemas.response import (
     GenderPrediction,
     GenderResult,
     HealthResponse,
+    LanguageResult,
     ReadinessResponse,
 )
 
@@ -62,6 +69,7 @@ async def ready(runtime: RuntimeDep) -> Response:
     body = ReadinessResponse(
         status="ready" if runtime.ready else "not_ready",
         model_loaded=runtime.model_loaded,
+        language_model_loaded=runtime.language_model_loaded,
         vad_loaded=runtime.vad_loaded,
         ffmpeg_available=runtime.ffmpeg_available,
     )
@@ -98,7 +106,9 @@ async def analyze(request: Request, runtime: RuntimeDep) -> AnalyzeResponse:
     parsed = await parse_analyze_multipart(request, runtime.settings)
     waveform = None
     speech_waveform = None
-    decode_ms = vad_ms = quality_ms = inference_ms = 0.0
+    decode_ms = vad_ms = quality_ms = inference_ms = language_inference_ms = 0.0
+    language = unknown_language()
+    language_outcome = "unknown"
     try:
         decode_started = time.perf_counter()
         waveform = await decode_audio(parsed.audio, runtime.settings)
@@ -143,16 +153,31 @@ async def analyze(request: Request, runtime: RuntimeDep) -> AnalyzeResponse:
                 runtime.settings,
             )
 
+            language, language_outcome, language_inference_ms = (
+                await detect_language_best_effort(
+                    runtime,
+                    speech_waveform,
+                    quality,
+                    vad_result.speech_duration_seconds,
+                    request.state.request_id,
+                )
+            )
+
+        runtime.metrics.language_outcomes.labels(outcome=language_outcome).inc()
+
         if gender.prediction is GenderPrediction.UNKNOWN:
             runtime.metrics.unknown_counts.labels(attribute="gender").inc()
         if age.prediction is AgeBracket.UNKNOWN:
             runtime.metrics.unknown_counts.labels(attribute="age_bracket").inc()
+        if language.code == "unknown":
+            runtime.metrics.unknown_counts.labels(attribute="language").inc()
 
         processing_ms = round(elapsed_ms(started))
         response = AnalyzeResponse(
             contact_id=parsed.contact_id,
             gender=gender,
             age_bracket=age,
+            language=language,
             processing_ms=processing_ms,
             audio_quality=quality,
         )
@@ -175,6 +200,8 @@ async def analyze(request: Request, runtime: RuntimeDep) -> AnalyzeResponse:
                     "vad_ms": round(vad_ms, 2),
                     "quality_ms": round(quality_ms, 2),
                     "inference_ms": round(inference_ms, 2),
+                    "language_inference_ms": round(language_inference_ms, 2),
+                    "language_outcome": language_outcome,
                     "processing_ms": processing_ms,
                     "audio_quality": quality.value,
                     "status": "success",
@@ -187,6 +214,55 @@ async def analyze(request: Request, runtime: RuntimeDep) -> AnalyzeResponse:
         clear_waveform(speech_waveform)
         if waveform is not speech_waveform:
             clear_waveform(waveform)
+
+
+async def detect_language_best_effort(
+    runtime: RuntimeState,
+    speech_waveform: FloatWaveform,
+    quality: AudioQuality,
+    speech_duration_seconds: float,
+    request_id: str,
+) -> tuple[LanguageResult, str, float]:
+    """Return optional language enrichment without failing core analysis."""
+
+    if speech_duration_seconds < runtime.settings.language_min_speech_seconds:
+        return unknown_language(), "unknown", 0.0
+    if runtime.language is None:
+        return unknown_language(), "unavailable", 0.0
+
+    started = time.perf_counter()
+    try:
+        raw = await runtime.language.infer(speech_waveform)
+        elapsed = elapsed_ms(started)
+        runtime.metrics.language_inference_latency.observe(elapsed / 1000.0)
+        result = process_language(
+            raw,
+            quality,
+            speech_duration_seconds,
+            runtime.settings,
+        )
+        return result, "predicted" if result.code != "unknown" else "unknown", elapsed
+    except LanguageInferenceTimeout:
+        elapsed = elapsed_ms(started)
+        runtime.metrics.language_inference_latency.observe(elapsed / 1000.0)
+        logger.warning(
+            "language_inference_timed_out",
+            extra={"event_fields": {"request_id": request_id}},
+        )
+        return unknown_language(), "timeout", elapsed
+    except Exception as exc:
+        elapsed = elapsed_ms(started)
+        runtime.metrics.language_inference_latency.observe(elapsed / 1000.0)
+        logger.exception(
+            "language_inference_failed",
+            extra={
+                "event_fields": {
+                    "request_id": request_id,
+                    "error_type": type(exc).__name__,
+                }
+            },
+        )
+        return unknown_language(), "error", elapsed
 
 
 def elapsed_ms(started: float) -> float:

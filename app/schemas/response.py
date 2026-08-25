@@ -41,12 +41,21 @@ class AgeBracketResult(PredictionResult):
     prediction: AgeBracket
 
 
+class LanguageResult(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    code: str = Field(pattern=r"^(?:[a-z]{2,3}|unknown)$")
+    name: str = Field(min_length=1, max_length=64)
+    confidence: float = Field(ge=0.0, le=1.0)
+
+
 class AnalyzeResponse(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     contact_id: UUID
     gender: GenderResult
     age_bracket: AgeBracketResult
+    language: LanguageResult
     processing_ms: int = Field(ge=0)
     audio_quality: AudioQuality
 
@@ -58,6 +67,7 @@ class HealthResponse(BaseModel):
 class ReadinessResponse(BaseModel):
     status: str
     model_loaded: bool
+    language_model_loaded: bool
     vad_loaded: bool
     ffmpeg_available: bool
 
@@ -70,4 +80,3 @@ class ErrorDetail(BaseModel):
 
 class ErrorResponse(BaseModel):
     error: ErrorDetail
-

@@ -60,6 +60,17 @@ class Settings(BaseSettings):
     )
     torch_compile_dynamic: bool = True
 
+    language_detection_enabled: bool = True
+    language_model_id: str = "speechbrain/lang-id-voxlingua107-ecapa"
+    language_model_revision: str = (
+        "0253049ae131d6a4be1c4f0d8b0ff483a0f8c8e9"
+    )
+    language_min_speech_seconds: float = 1.5
+    language_confidence_threshold: float = 0.65
+    language_min_margin: float = 0.15
+    language_inference_timeout_seconds: float = 3.0
+    language_inference_max_concurrency: int = 1
+
     gender_confidence_threshold: float = 0.65
     gender_min_margin: float = 0.10
     quality_multiplier_good: float = 1.0
@@ -89,6 +100,8 @@ class Settings(BaseSettings):
         "quality_multiplier_degraded",
         "quality_multiplier_insufficient",
         "age_confidence_threshold",
+        "language_confidence_threshold",
+        "language_min_margin",
     )
     @classmethod
     def validate_unit_interval(cls, value: float) -> float:
@@ -101,6 +114,7 @@ class Settings(BaseSettings):
         "max_upload_bytes",
         "max_multipart_overhead_bytes",
         "inference_max_concurrency",
+        "language_inference_max_concurrency",
     )
     @classmethod
     def validate_positive_int(cls, value: int) -> int:
@@ -114,6 +128,8 @@ class Settings(BaseSettings):
         "decode_timeout_seconds",
         "inference_timeout_seconds",
         "age_boundary_scale_years",
+        "language_min_speech_seconds",
+        "language_inference_timeout_seconds",
     )
     @classmethod
     def validate_positive_float(cls, value: float) -> float:

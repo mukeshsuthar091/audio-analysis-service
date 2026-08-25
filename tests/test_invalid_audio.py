@@ -95,6 +95,7 @@ async def test_not_ready_returns_503() -> None:
     assert ready.json() == {
         "status": "not_ready",
         "model_loaded": False,
+        "language_model_loaded": False,
         "vad_loaded": False,
         "ffmpeg_available": False,
     }

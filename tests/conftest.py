@@ -13,6 +13,7 @@ from app.audio.vad import SpeechSegment, VADResult, build_vad_result
 from app.core.config import Settings
 from app.core.metrics import Metrics
 from app.core.runtime import RuntimeState
+from app.inference.language import RawLanguageOutput
 from app.inference.model import RawModelOutput
 from app.main import create_app
 
@@ -62,6 +63,20 @@ class FakeModel:
         )
 
 
+class FakeLanguageModel:
+    def __init__(self) -> None:
+        self.calls = 0
+
+    async def infer(self, waveform: np.ndarray) -> RawLanguageOutput:
+        assert waveform.size > 0
+        self.calls += 1
+        return RawLanguageOutput(
+            label="en: English",
+            top_probability=0.92,
+            runner_up_probability=0.03,
+        )
+
+
 def make_settings(**overrides: object) -> Settings:
     defaults: dict[str, object] = {
         "max_upload_bytes": 1024 * 1024,
@@ -86,6 +101,7 @@ def make_test_app(settings: Settings | None = None, ready: bool = True) -> FastA
             ffmpeg_available=True,
             vad=FakeVAD(current),
             model=FakeModel(),
+            language=FakeLanguageModel(),
         )
 
     return create_app(settings=selected, runtime_factory=factory)
