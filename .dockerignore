@@ -1,0 +1,14 @@
+.git
+.gitignore
+.venv
+__pycache__
+*.py[cod]
+.pytest_cache
+.ruff_cache
+tests
+samples
+scripts
+requirements-dev.txt
+audio-analysis-architecture.md
+.env
+

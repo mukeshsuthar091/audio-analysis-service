@@ -1,0 +1,24 @@
+services:
+  api:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: audio-contact-attribute-analysis:local
+    init: true
+    ports:
+      - "8000:8000"
+    environment:
+      AAS_DEVICE: cpu
+      AAS_LOG_LEVEL: INFO
+      AAS_TORCH_COMPILE: "false"
+      HF_HOME: /home/app/.cache/huggingface
+      TORCHINDUCTOR_CACHE_DIR: /home/app/.cache/torchinductor
+    volumes:
+      - huggingface-cache:/home/app/.cache/huggingface
+      - torchinductor-cache:/home/app/.cache/torchinductor
+    restart: unless-stopped
+    stop_grace_period: 30s
+
+volumes:
+  huggingface-cache:
+  torchinductor-cache:
