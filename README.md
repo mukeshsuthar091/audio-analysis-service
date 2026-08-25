@@ -37,29 +37,57 @@ Version 1 implements buffered REST analysis only. It does not implement streamin
 ## Architecture
 
 ```mermaid
-flowchart LR
-    Client[Telephony adapter] --> API[FastAPI /analyze]
-    API --> Parser[Bounded in-memory multipart parser]
-    Parser --> Decode{Normalized WAV?}
-    Decode -- Mono 16 kHz PCM16/float32 --> Direct[Direct RIFF decode]
-    Decode -- Other self-describing audio --> FFmpeg[FFmpeg normalize]
-    Direct --> Validate[Waveform validation]
-    FFmpeg --> Validate
-    Validate --> VAD[Silero VAD]
-    VAD --> Quality[Quality analysis]
-    Quality --> Gate{Sufficient speech?}
-    Gate -- No --> Unknown[Unknown / insufficient]
-    Gate -- Yes --> Worker[Bounded inference worker]
-    Worker --> Model[6-layer Wav2Vec2]
-    Model --> Policy[Age and gender policy]
-    Worker --> LID[VoxLingua107 language ID]
-    LID --> Policy
-    Policy --> Response[Typed JSON]
-    Unknown --> Response
-    API -. logs and timings .-> Observe[Prometheus + JSON logs]
+flowchart TD
+    subgraph Startup[Application lifespan]
+        FFCheck[Verify FFmpeg]
+        VADLoad[Load and warm Silero VAD]
+        AGLoad[Load and warm audEERING model]
+        LIDLoad[Load and warm optional VoxLingua107]
+        CoreReady{Core ready?}
+
+        FFCheck --> CoreReady
+        VADLoad --> CoreReady
+        AGLoad --> CoreReady
+        LIDLoad --> LIDState[Independent language readiness]
+    end
+
+    subgraph Request[POST /analyze request path]
+        Client[Inbound contact audio] --> API[FastAPI and request ID]
+        API --> Parser[Bounded in-memory multipart parser]
+        Parser --> WAV{Normalized mono 16 kHz WAV?}
+        WAV -- Yes --> Direct[Direct RIFF PCM decode]
+        WAV -- No --> FFmpeg[FFmpeg pipe normalization]
+        Direct --> Validate[Waveform validation]
+        FFmpeg --> Validate
+        Validate --> VAD[Voice activity detection]
+        VAD --> Quality[Quality and approximate SNR]
+        Quality --> SpeechGate{At least 1 second usable speech?}
+
+        SpeechGate -- No --> AllUnknown[All attributes unknown]
+        SpeechGate -- Yes --> AGWorker[Bounded age and gender worker]
+        AGWorker --> AGModel[Six-layer Wav2Vec2]
+        AGModel --> AGPolicy[Age bracket and gender safeguards]
+        AGPolicy --> LanguageGate{At least 1.5 seconds and language model available?}
+        LanguageGate -- Yes --> LIDWorker[Independent bounded language worker]
+        LIDWorker --> LIDModel[VoxLingua107 ECAPA]
+        LIDModel --> LIDPolicy[Label, confidence, and margin safeguards]
+        LanguageGate -- No --> LanguageUnknown[Language unknown]
+        Response[Typed JSON response]
+
+        LIDPolicy --> Response
+        LanguageUnknown --> Response
+        AllUnknown --> Response
+    end
+
+    CoreReady -- Yes --> API
+    CoreReady -- No --> Unavailable[Analyze returns 503; health stays live]
+    LIDState -. Optional enrichment .-> LanguageGate
+    API -. Timings and bounded outcomes .-> Observe[Structured JSON logs and Prometheus metrics]
 ```
 
-FastAPI lifespan loads and warms FFmpeg availability, Silero VAD, and the audEERING model once. Readiness is set only after all required components succeed. One Uvicorn worker is used by default because each process would otherwise load another large model. CPU-heavy work runs outside the event loop, and model inference is protected by a bounded executor and semaphore.
+FastAPI lifespan verifies FFmpeg and loads and warms Silero VAD, the audEERING age/gender model, and the optional SpeechBrain language model once per process. Core readiness requires FFmpeg, VAD, and age/gender inference; a language-model failure only sets `language_model_loaded` to false and produces an `unknown` language result. `/health` remains live even when required startup work fails.
+
+The request pipeline keeps caller audio in request-owned memory. Normalized PCM WAV uses the direct parser, while compressed or differently encoded audio is normalized through FFmpeg pipes. VAD supplies one shared speech waveform to both inference stages. On CPU, age/gender runs first and language runs second because benchmarks showed no useful parallel improvement. Each model has an independent bounded executor and semaphore, so CPU work does not block the event loop and overload cannot create unbounded inference concurrency.
 
 ## Processing flow
 
